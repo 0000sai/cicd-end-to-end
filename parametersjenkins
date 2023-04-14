@@ -1,0 +1,203 @@
+pipeline {
+    agent any
+    parameters {
+        choice(
+            name: 'buildType',
+            choices: 'debug\nrelease', 
+            description: 'Choose build type.'
+        )
+        string( 
+            name: 'commitId',
+            defaultValue: '*/master', 
+            description: 'Commit id to build.'
+        )
+        string(
+            name: 'targetVersion',
+            defaultValue: '1.0.0', 
+            description: 'Engine version.'
+        )
+        string(
+            name: 'clientBranch',
+            defaultValue: 'build11',
+            description: 'Clinet branch to upload dll.'
+        )   
+        booleanParam(
+            name: 'runSh',
+            defaultValue: false,
+            description: 'Run run.sh file after build.'
+        )
+        booleanParam(
+            name: 'paramUpdate',
+            defaultValue: false, 
+            description: 'Apply parameter update.'
+        )
+    }
+
+    stages {
+        stage('Parameter Update') {
+            when {
+                environment name: 'paramUpdate', value: 'true'
+            }
+            steps {
+                script {
+                    currentBuild.result = 'ABORTED'
+                    error("Build for parameter update.")
+                }
+            }
+        }
+
+        stage('Engine Check') {
+            steps {
+                script {
+                    // Get current engine version.
+                    def version = sh returnStdout: true, script: """
+                        yum list installed engine_name | grep -E "((\\-|\\.|[0-9]*)*)" -o | head -1 | rev
+                    """
+
+                    if(!version.trim().equals(params.targetVersion.trim()))
+                    {
+                        echo "current version: ${version.trim()}, target version: ${params.targetVersion.trim()}"
+                        sh """
+                            sudo yum erase -y engine_name
+                            sudo yum update -y
+                            sudo yum install -y engine_name-${params.targetVersion}
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Checkout') {
+            steps {
+                script {
+                    // Get code from git.
+                    currentRevision = checkout([
+                        $class: 'GitSCM',
+                        branches: [[name : "${params.commitId}"]],
+                        userRemoteConfigs: [[
+                            credentialsId: 'git_ssh_master',
+                            url: 'ssh://git@git_url'
+                        ]]
+                    ])
+                }
+            }
+        }
+
+        stage('Build') {
+            steps {
+                script {
+                    sh "make -C ./build/${params.buildType}/ -j4"
+                    sh "make package -C ./build/${params.buildType}/"
+                }
+            }
+        }
+
+        stage('Archive') {
+            steps {
+                archive "build/${params.buildType}/*.rpm"
+            }
+        }
+
+        stage('Upload DLL') {
+            steps {
+                script {
+                    // Commit dll if changed.
+                    withCredentials([usernamePassword(credentialsId: 'jenkins_svn', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+                        try {
+                            sh "svn checkout https://svndev_url/branches/${clientBranch} ../${clientBranch}"
+                        } catch (err){
+                            println "svn checkout failed: ${err}"
+                        }                        
+                        try {
+                            sh "svn upgrade ../${params.clientBranch}/"
+                        } catch(err) {
+                            println "svn upgrade failed: ${err}"
+                        }
+                        try {
+                            sh "svn cleanup ../${params.clientBranch}/" 
+                        }
+                        catch(err) {
+                            println "svn cleanup failed : ${err}"
+                        }
+                    }
+
+                    withCredentials([usernamePassword(credentialsId: 'jenkins_svn', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+                        sh "svn update ../${params.clientBranch}/"
+                        sh "svn revert ../${params.clientBranch}/messages.dll"
+                        sh "rm ../${params.clientBranch}/messages.dll"
+                        sh "cp ./build/${params.buildType}/messages.dll ../${params.clientBranch}/messages.dll"
+                        modState = sh(returnStdout: true, script:""" 
+                            svn status ../${params.clientBranch}/
+                        """).trim()
+                        
+                        if(modState)
+                        {
+                            sh "svn commit ../${params.clientBranch}/ -m \"DLL sync (${currentRevision.trim()})\""
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Upload Rpm') {
+            agent {
+                label 'master'
+            }
+            steps {
+                script {
+                    targetServerInfo = "aws-test"
+                    try {
+                        sh "ssh ${targetServerInfo} 'rm ./*.rpm'"
+                    } catch(err) {
+                        // rm can fail.
+                    }
+                    try {
+                        sh "scp ${archivedPath}/*.rpm ${targetServerInfo}:"
+                    }
+                    catch(err) {
+                        error "Failed rpm upload: ${err}."
+                    }
+                }
+            }
+        }
+        
+        stage('Run.sh') {
+            agent {
+                label 'master'
+            }
+            when {
+                environment name: 'runSh', value: 'true'
+            }
+            steps {
+                script {
+                    sh "ssh ${targetServerInfo} sudo sh ./run.sh"
+
+                    emailext (
+                        to: 'wsong0101@gmail.com',
+                        subject: "${emailTitle}",
+                        body: '''${SCRIPT, template="notify.email.groovy.template"}'''
+                    )
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            emailext (
+                to: 'wsong0101@gmail.com',
+                subject: "[BuildResult][${currentBuild.currentResult}] - Job '${env.JOB_NAME}' (${env.BUILD_NUMBER})",
+                body: '''${SCRIPT, template="email.groovy.template"}''',
+                attachLog: true
+            )
+        }
+        failure {
+            emailext (
+                to: 'wsong0101@gmail.com',
+                subject: "[BuildResult][${currentBuild.currentResult}] - Job '${env.JOB_NAME}' (${env.BUILD_NUMBER})",
+                body: '''${SCRIPT, template="email.groovy.template"}''',
+                attachLog: true
+            )
+        }
+    }
+}
